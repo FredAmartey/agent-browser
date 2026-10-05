@@ -100,6 +100,8 @@ agent-browser close
 
 Clicks fail early when another element covers the target's click point, for example a consent banner or modal. Dismiss or interact with the reported covering element, then take a fresh snapshot before retrying the original ref.
 
+`fill` sets date, time, color and range inputs directly, so pass the value in the input's own format (`2024-01-15` for a date, `#ff8800` for a color); a value the input rejects fails with `Malformed value` and leaves the field unchanged. `fill` and `type` fail on elements that can't take text, such as selects, checkboxes, buttons and hidden inputs. Use `select`, `check` or `click` for those.
+
 Headless Chromium screenshots hide native scrollbars for consistent image output. Pass `--hide-scrollbars false` when launching to keep native scrollbars visible.
 
 ### Traditional Selectors (also supported)

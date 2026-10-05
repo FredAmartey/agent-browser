@@ -161,6 +161,8 @@ agent-browser drag @e1 @e2                # drag and drop
 agent-browser drag @e1 @e2 --human        # drag with curved, eased movement
 ```
 
+`fill` sets date, time, color and range inputs directly, so pass the value in the input's own format (`2024-01-15` for a date, `#ff8800` for a color); a value the input rejects fails with `Malformed value` and leaves the field unchanged. `fill` and `type` fail on elements that can't take text, such as selects, checkboxes, buttons and hidden inputs. Use `select`, `check` or `click` for those.
+
 ### When refs don't work or you don't want to snapshot
 
 Use semantic locators:

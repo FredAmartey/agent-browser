@@ -862,7 +862,7 @@ fn tools() -> Vec<Value> {
         tool(
             TOOL_FILL,
             "Fill input",
-            "Clear and fill an input by @ref or CSS selector.",
+            "Clear and fill a text input or textarea, or type into a contenteditable element, by @ref or CSS selector. Date, time, color and range inputs get the value set directly; elements that can't take text are an error.",
             json!({
                 "selector": selector_schema(),
                 "text": { "type": "string", "description": "Text to fill." }
@@ -872,7 +872,7 @@ fn tools() -> Vec<Value> {
         tool(
             TOOL_TYPE,
             "Type text",
-            "Type text into an element by @ref or CSS selector.",
+            "Type text into a text input, textarea or contenteditable element by @ref or CSS selector. Other elements are an error; use fill for date, time, color and range inputs.",
             json!({
                 "selector": selector_schema(),
                 "text": { "type": "string", "description": "Text to type." },

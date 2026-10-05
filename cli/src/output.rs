@@ -1783,6 +1783,11 @@ Usage: agent-browser fill <selector> <text>
 Clears the input field and fills it with the specified text.
 This replaces any existing content in the field.
 
+Date, time, color and range inputs get the value set directly, in
+the input's own format (2024-01-15 for a date, #ff8800 for a color).
+Elements that can't take text, such as selects, checkboxes, buttons
+and hidden inputs, are an error.
+
 Global Options:
   --json               Output as JSON
   --session <name>     Use specific session
@@ -1791,6 +1796,7 @@ Examples:
   agent-browser fill "#email" "user@example.com"
   agent-browser fill @e3 "Hello World"
   agent-browser fill "input[name='search']" "query"
+  agent-browser fill "#birthday" "1990-05-20"
 "##
         }
         "type" => {
@@ -1801,6 +1807,9 @@ Usage: agent-browser type <selector> <text>
 
 Types text into the specified element character by character.
 Unlike fill, this does not clear existing content first.
+
+Elements that can't take text are an error, as with fill. For date,
+time, color and range inputs, use fill.
 
 Global Options:
   --json               Output as JSON

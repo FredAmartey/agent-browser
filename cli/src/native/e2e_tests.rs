@@ -2078,6 +2078,2406 @@ async fn e2e_form_interaction() {
 
 #[tokio::test]
 #[ignore]
+async fn e2e_fill_sets_value_type_inputs_directly() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let html = r#"<input id="date" type="date"><input id="time" type="time">
+        <input id="datetime" type="datetime-local"><input id="month" type="month">
+        <input id="week" type="week"><input id="color" type="color">
+        <input id="range" type="range" max="100"><input id="locked" type="date" value="2024-01-01" readonly>
+        <script>
+            window.events = [];
+            for (const el of document.querySelectorAll('input'))
+                for (const type of ['input', 'change'])
+                    el.addEventListener(type, () => events.push(el.id + ':' + type));
+            // React records each value it writes through an instance-level
+            // value property and reports a change only when the DOM differs.
+            const date = document.getElementById('date');
+            const native = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+            let tracked = date.value;
+            Object.defineProperty(date, 'value', {
+                get() { return native.get.call(this); },
+                set(v) { tracked = String(v); native.set.call(this, v); },
+            });
+            window.reactChanges = [];
+            date.addEventListener('input', () => {
+                if (date.value !== tracked) { tracked = date.value; reactChanges.push(date.value); }
+            });
+        </script>"#;
+    // Base64, since a plain data: URL ends at the first '#'.
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Issue #2000: Chrome ignores typed text on these, so fill used to leave
+    // them empty. Playwright trims the value, and Chrome lowercases colors and
+    // normalizes some valid values (seconds of :00, a trailing .0).
+    let cases = [
+        ("date", "2024-01-15", "2024-01-15"),
+        ("time", " 09:30 ", "09:30"),
+        ("datetime", "2024-01-15T09:30:00", "2024-01-15T09:30"),
+        ("month", "2024-03", "2024-03"),
+        ("week", "2024-W05", "2024-W05"),
+        ("color", "#FF8800", "#ff8800"),
+        ("range", "75.0", "75"),
+    ];
+    let mut events = Vec::new();
+    for (id, value, expected) in cases {
+        let resp = execute_command(
+            &json!({ "id": id, "action": "fill", "selector": format!("#{id}"), "value": value }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        let script = format!("document.getElementById('{id}').value");
+        assert_evaluate(&mut state, id, &script, json!(expected)).await;
+        events.extend([format!("{id}:input"), format!("{id}:change")]);
+    }
+    assert_evaluate(&mut state, "events", "events", json!(events)).await;
+    assert_evaluate(&mut state, "react", "reactChanges", json!(["2024-01-15"])).await;
+
+    // A value the browser rejects or clamps (max is 100, so the midpoint is
+    // 50) and a readonly input (the value setter ignores readonly) are errors
+    // that leave the field alone.
+    let refused = [
+        ("#date", "01/15/2024", "Malformed value"),
+        ("#range", "150", "Malformed value"),
+        // Not a number to HTML, so Chrome sets the midpoint, though Number()
+        // reads it as 50.
+        ("#range", "0x32", "Malformed value"),
+        (
+            "#locked",
+            "2024-02-02",
+            "Element '#locked' is readonly and cannot be filled",
+        ),
+    ];
+    for (selector, value, error) in refused {
+        let resp = execute_command(
+            &json!({ "id": "bad", "action": "fill", "selector": selector, "value": value }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(resp["success"], false, "{selector}: {resp}");
+        assert!(
+            resp["error"].as_str().unwrap_or_default().contains(error),
+            "{selector}: {resp}"
+        );
+    }
+    assert_evaluate(
+        &mut state,
+        "kept",
+        "['date', 'range', 'locked'].map((id) => document.getElementById(id).value).concat(events.length)",
+        json!(["2024-01-15", "75", "2024-01-01", events.len()]),
+    )
+    .await;
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_fill_and_type_refuse_elements_that_cannot_take_text() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let html = concat!(
+        "data:text/html,<input id='name'>",
+        "<select id='choice'><option>a</option></select>",
+        "<input id='agree' type='checkbox'>",
+        "<button id='go'>Go</button>",
+        "<input id='color' type='color'>",
+        "<input id='hidden' style='display:none'>",
+        "<div id='ce-box' contenteditable>outer<input id='ce-disabled' disabled value='old'>",
+        "<textarea id='ce-hidden' style='display:none'>old</textarea>",
+        "<select id='ce-select'><option>a</option></select><button id='ce-button' disabled value='v'>B</button></div>",
+        "<div id='nest-box' contenteditable>before <span id='nest' contenteditable tabindex='0'>text</span>",
+        " <span id='nest-plain' tabindex='0'>abc</span></div><div id='keep' tabindex='0'>plain</div>",
+        "<div id='moves-out' tabindex='0'>out</div><input id='jumps'><x-away id='away' tabindex='0'></x-away>",
+        "<div id='svg-box'><svg><slot></slot></svg></div>",
+        "<x-form><input id='x-a'><input id='x-b'></x-form><x-open id='open-host'></x-open><div id='closed-host'></div>",
+        "<div id='dc-editor' contenteditable style='display: contents'>text<input id='dc-control'></div>",
+        "<x-closed-box id='closed-box'></x-closed-box><div id='closed-div-box'></div>",
+        "<svg id='svg-fo' width='220' height='40'><foreignObject width='200' height='30'><input id='svg-fo-input'></foreignObject></svg>",
+        "<div style='-webkit-user-modify: read-write'>before <span id='css-nest' tabindex='0'>text</span></div>",
+        "<label><div id='out-labelled' tabindex='0'>out</div> <input id='out-keep' value='KEEP'></label>",
+        "<input id='morph'><input id='morph-date' type='date'><script>",
+        "customElements.define('x-open', class extends HTMLElement { constructor() { super();",
+        " this.attachShadow({ mode: 'open' }).innerHTML = '<input>'; } });",
+        "const hostRoot = document.getElementById('closed-host').attachShadow({ mode: 'closed' });",
+        "hostRoot.innerHTML = '<input>'; window.closedHostInput = hostRoot.querySelector('input');",
+        "document.getElementById('closed-div-box').attachShadow({ mode: 'closed', delegatesFocus: true })",
+        ".innerHTML = '<input type=checkbox>';",
+        "customElements.define('x-closed-box', class extends HTMLElement { constructor() { super();",
+        " this.attachShadow({ mode: 'closed', delegatesFocus: true }).innerHTML = '<input type=checkbox>'; } });",
+        "const toName = () => queueMicrotask(() => document.getElementById('name').focus());",
+        "document.getElementById('out-labelled').addEventListener('focus', toName);",
+        "for (const id of ['morph', 'morph-date']) { let focuses = 0; const el = document.getElementById(id);",
+        " el.addEventListener('focus', () => { if (++focuses === 1) toName(); else el.type = 'checkbox'; }); }",
+        "const frame = document.createElement('iframe'); document.body.append(frame);",
+        "const adopted = frame.contentDocument.createElement('div'); adopted.id = 'adopted-box';",
+        "adopted.innerHTML = '<input id=adopted-input>'; document.body.append(adopted);",
+        "document.getElementById('moves-out').addEventListener('focus', toName);",
+        "document.getElementById('jumps').addEventListener('focus', toName);",
+        "customElements.define('x-away', class extends HTMLElement { constructor() { super();",
+        " this.addEventListener('focus', () => setTimeout(() => document.getElementById('name').focus())); } });",
+        "</script>",
+    );
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": html }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "fill", "selector": "#name", "value": "Jane" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Issue #2055: each of these reported success and wrote into #name, the
+    // field that last held the selection.
+    let not_text = "is not an <input>, <textarea> or [contenteditable] element";
+    let checkbox = "of type \"checkbox\" cannot be filled";
+    let cases = [
+        ("fill", "#choice", not_text),
+        ("fill", "#agree", checkbox),
+        ("fill", "#go", not_text),
+        ("type", "#go", not_text),
+        ("type", "#color", "use fill"),
+        ("fill", "#hidden", "did not take focus"),
+        // Classified by the checkbox inside their closed shadow roots.
+        ("fill", "#closed-box", checkbox),
+        ("fill", "#closed-div-box", checkbox),
+        // A control inside editable content that won't take focus must not
+        // hand the text to its editing host.
+        ("fill", "#ce-disabled", "did not take focus"),
+        ("type", "#ce-hidden", "did not take focus"),
+        // Chrome reports isContentEditable for these inside an editing host,
+        // but they are refused as anywhere else.
+        ("fill", "#ce-select", not_text),
+        ("fill", "#ce-button", not_text),
+        // A built-in element that keeps focus itself takes no text.
+        ("type", "#keep", not_text),
+        // Focus a handler moves on in a microtask is read once it has moved,
+        // so the text doesn't follow it out into #name.
+        ("type", "#moves-out", not_text),
+        ("type", "#jumps", "did not take focus"),
+        // Focus a timer moves out between reads is not followed out either.
+        ("fill", "#away", not_text),
+        // An SVG <slot> inside is not a slot that takes assigned nodes.
+        ("fill", "#svg-box", not_text),
+        // Focus a handler passes out of a host inside a label stays the
+        // host's to refuse; it doesn't fall to the label's control.
+        ("fill", "#out-labelled", not_text),
+        // A handler that makes the target a checkbox when it is focused to
+        // take the text, after it was classified, typed or set.
+        ("fill", "#morph", "changed before the text reached it"),
+        ("fill", "#morph-date", "changed before the text reached it"),
+    ];
+    for (action, selector, error) in cases {
+        let text_key = if action == "fill" { "value" } else { "text" };
+        let mut cmd = json!({ "id": action, "action": action, "selector": selector });
+        cmd[text_key] = json!("leak");
+        let resp = execute_command(&cmd, &mut state).await;
+        assert_eq!(resp["success"], false, "{action} {selector}: {resp}");
+        assert!(
+            resp["error"].as_str().unwrap_or_default().contains(error),
+            "{action} {selector}: {resp}"
+        );
+        assert_evaluate(
+            &mut state,
+            "name",
+            "document.getElementById('name').value",
+            json!("Jane"),
+        )
+        .await;
+    }
+    assert_evaluate(
+        &mut state,
+        "untouched",
+        "['hidden', 'color', 'ce-disabled', 'ce-hidden', 'ce-select', 'ce-button', 'out-keep', 'morph', 'morph-date']
+            .map((id) => document.getElementById(id).value)
+            .concat(document.getElementById('ce-box').textContent)",
+        json!(["", "#000000", "old", "old", "a", "v", "KEEP", "on", "on", "outeroldaB"]),
+    )
+    .await;
+
+    // Focusable content inside an editor (a nested editor, or a span with
+    // tabindex) takes focus without the caret. A caret already inside it
+    // stays; with #name holding the caret, it moves to the end of the element
+    // rather than the text landing in #name.
+    let focus_name = "document.getElementById('name').focus()";
+    let caret_in_span =
+        "getSelection().collapse(document.getElementById('nest-plain').firstChild, 1)";
+    for (setup, action, key, id, text, expected) in [
+        (focus_name, "type", "text", "nest", "X", "textX"),
+        (focus_name, "fill", "value", "nest", "Y", "textXY"),
+        (caret_in_span, "type", "text", "nest-plain", "X", "aXbc"),
+        (focus_name, "type", "text", "nest-plain", "Y", "aXbcY"),
+        (focus_name, "fill", "value", "nest-plain", "Z", "aXbcYZ"),
+        // Likewise in an editor made editable by -webkit-user-modify.
+        (focus_name, "type", "text", "css-nest", "X", "textX"),
+    ] {
+        let setup = json!({ "id": "nest", "action": "evaluate", "script": setup });
+        assert_success(&execute_command(&setup, &mut state).await);
+        let selector = format!("#{id}");
+        let resp = execute_command(
+            &json!({ "id": "nest", "action": action, "selector": selector, key: text }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        let script = format!(
+            "[document.getElementById('name').value, document.getElementById('{id}').textContent]"
+        );
+        assert_evaluate(&mut state, action, &script, json!(["Jane", expected])).await;
+    }
+
+    // Focus already inside a container that neither takes focus nor hands it
+    // on came from earlier; filling the container must not write there.
+    let containers = [
+        ("x-form", "document.getElementById('x-a')", not_text),
+        (
+            "#open-host",
+            "document.getElementById('open-host').shadowRoot.querySelector('input')",
+            not_text,
+        ),
+        ("#closed-host", "closedHostInput", not_text),
+        // An SVG element whose focus() does nothing, with a foreignObject.
+        (
+            "#svg-fo",
+            "document.getElementById('svg-fo-input')",
+            not_text,
+        ),
+        // Made in a frame, so its prototypes are the frame's, then moved here.
+        (
+            "#adopted-box",
+            "document.getElementById('adopted-input')",
+            not_text,
+        ),
+        (
+            "#dc-editor",
+            "document.getElementById('dc-control')",
+            "did not take focus",
+        ),
+    ];
+    for (selector, field, error) in containers {
+        let setup =
+            format!("(() => {{ const field = {field}; field.value = 'Ada'; field.focus(); }})()");
+        assert_success(
+            &execute_command(
+                &json!({ "id": "setup", "action": "evaluate", "script": setup }),
+                &mut state,
+            )
+            .await,
+        );
+        let resp = execute_command(
+            &json!({ "id": "fill", "action": "fill", "selector": selector, "value": "Lin" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(resp["success"], false, "{selector}: {resp}");
+        assert!(
+            resp["error"].as_str().unwrap_or_default().contains(error),
+            "{selector}: {resp}"
+        );
+        assert_evaluate(&mut state, "field", &format!("{field}.value"), json!("Ada")).await;
+    }
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_fill_and_type_reach_inputs_behind_labels_custom_elements_and_editors() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let html = r#"<label>Name <span id="name-text">here</span> <input id="name"></label>
+        <label id="when-label" for="when">When</label> <input id="when" type="date">
+        <x-field id="field"></x-field>
+        <div id="editor" role="textbox" tabindex="0"></div>
+        <x-closed id="closed"></x-closed>
+        <label id="email-label">Email <fa-field id="email"></fa-field></label>
+        <label><x-field id="plain"></x-field> <input id="other"></label>
+        <div id="ce-box" contenteditable>outer<input id="inside" value="old"></div>
+        <div id="closed-div"></div>
+        <label><div id="closed-labelled"></div> <input id="other-labelled"></label>
+        <label><div id="label-editor" role="textbox" tabindex="0"></div> <input id="label-other" value="keep"></label>
+        <div id="list-editor" contenteditable><ol><li id="list-item">item</li></ol></div>
+        <div id="fwd-editor" contenteditable>notes <textarea id="fwd-area"></textarea></div>
+        <x-override id="override"></x-override>
+        <div id="wrap" role="textbox" tabindex="0"><textarea id="wrap-area"></textarea></div>
+        <div id="later" tabindex="0"><input id="later-input"></div>
+        <div id="blur-later" tabindex="0"><input id="blur-later-input"></div>
+        <div id="css-editor" style="-webkit-user-modify: read-write">hello</div>
+        <div id="css-plain" style="-webkit-user-modify: read-write-plaintext-only">plain</div>
+        <div id="css-host" style="-webkit-user-modify: read-write"><span id="css-span">span</span></div>
+        <input id="css-keep" value="KEEP"><label for="css-keep"><div id="css-labelled" style="-webkit-user-modify: read-write">note</div></label>
+        <svg id="svg-override" width="220" height="40"><foreignObject width="200" height="30"><input id="svg-override-input"></foreignObject></svg>
+        <svg width="220" height="40"><g id="svg-handler" tabindex="0"><foreignObject width="200" height="30"><input id="svg-handler-input"></foreignObject></g></svg>
+        <label><input id="blur-keep" value="KEEP"> <div id="blur-labelled" tabindex="0"><input id="blur-labelled-input"></div></label>
+        <div id="frame-wrap" tabindex="0"><iframe id="wrap-frame" srcdoc="<input id='field'>"></iframe></div>
+        <x-stop id="stop" tabindex="0"></x-stop>
+        <div id="closed-wrap" tabindex="0"></div>
+        <x-closed-wrap id="closed-custom" tabindex="0"></x-closed-wrap>
+        <div id="deep5" tabindex="0"><input id="deep5-input"></div>
+        <div id="deep20" tabindex="0"><input id="deep20-input"></div>
+        <script>
+            customElements.define('x-field', class extends HTMLElement {
+                constructor() {
+                    super();
+                    this.attachShadow({ mode: 'open', delegatesFocus: true }).innerHTML = '<input>';
+                }
+            });
+            customElements.define('x-closed', class extends HTMLElement {
+                constructor() {
+                    super();
+                    const root = this.attachShadow({ mode: 'closed', delegatesFocus: true });
+                    root.innerHTML = '<input>';
+                    window.closedInput = root.querySelector('input');
+                }
+            });
+            customElements.define('x-override', class extends HTMLElement {
+                constructor() {
+                    super();
+                    this.attachShadow({ mode: 'open' }).innerHTML = '<input>';
+                }
+                focus() { this.shadowRoot.querySelector('input').focus(); }
+            });
+            customElements.define('fa-field', class extends HTMLElement {
+                static formAssociated = true;
+                constructor() {
+                    super();
+                    this.attachShadow({ mode: 'open', delegatesFocus: true }).innerHTML = '<input>';
+                }
+            });
+            window.inner = (id) => document.getElementById(id).shadowRoot.querySelector('input').value;
+            document.getElementById('wrap').addEventListener('focus', () => {
+                document.getElementById('wrap-area').focus();
+            });
+            document.getElementById('later').addEventListener('focus', () => {
+                queueMicrotask(() => document.getElementById('later-input').focus());
+            });
+            const helper = document.createElement('iframe');
+            document.body.append(helper);
+            const adopted = helper.contentDocument.createElement('div');
+            adopted.id = 'adopted-fwd';
+            adopted.tabIndex = 0;
+            adopted.innerHTML = '<input id="adopted-fwd-input">';
+            document.body.append(adopted);
+            adopted.addEventListener('focus', () => document.getElementById('adopted-fwd-input').focus());
+            const svgOverride = document.getElementById('svg-override');
+            svgOverride.focus = () => document.getElementById('svg-override-input').focus();
+            document.getElementById('svg-handler').addEventListener('focus', () => {
+                document.getElementById('svg-handler-input').focus();
+            });
+            for (const id of ['blur-later', 'blur-labelled']) {
+                const wrap = document.getElementById(id);
+                wrap.addEventListener('focus', () => {
+                    wrap.blur();
+                    queueMicrotask(() => wrap.querySelector('input').focus());
+                });
+            }
+            window.frameField = () => document.getElementById('wrap-frame').contentDocument.getElementById('field');
+            document.getElementById('frame-wrap').addEventListener('focus', () => frameField().focus());
+            customElements.define('x-stop', class extends HTMLElement {
+                constructor() {
+                    super();
+                    this.attachShadow({ mode: 'open' }).innerHTML = '<input>';
+                    this.addEventListener('focus', (event) => {
+                        event.stopImmediatePropagation();
+                        this.shadowRoot.querySelector('input').focus();
+                    }, true);
+                }
+            });
+            const wrapRoot = document.getElementById('closed-wrap').attachShadow({ mode: 'closed' });
+            wrapRoot.innerHTML = '<input>';
+            window.closedWrapInput = wrapRoot.querySelector('input');
+            document.getElementById('closed-wrap').addEventListener('focus', () => closedWrapInput.focus());
+            customElements.define('x-closed-wrap', class extends HTMLElement {
+                constructor() {
+                    super();
+                    const root = this.attachShadow({ mode: 'closed' });
+                    root.innerHTML = '<input>';
+                    window.closedCustomInput = root.querySelector('input');
+                    this.addEventListener('focus', () => closedCustomInput.focus());
+                }
+            });
+            const focusAfter = (id, steps) => document.getElementById(id).addEventListener('focus', async () => {
+                for (let i = 0; i < steps; i++) await Promise.resolve();
+                document.getElementById(id + '-input').focus();
+            });
+            focusAfter('deep5', 5);
+            focusAfter('deep20', 20);
+            const attachClosed = (id) => {
+                const root = document.getElementById(id).attachShadow({ mode: 'closed', delegatesFocus: true });
+                root.innerHTML = '<input>';
+                return root.querySelector('input');
+            };
+            window.closedDivInput = attachClosed('closed-div');
+            window.labelledInput = attachClosed('closed-labelled');
+            const labelContext = new EditContext();
+            document.getElementById('label-editor').editContext = labelContext;
+            window.labelEditorText = '';
+            labelContext.addEventListener('textupdate', (e) => { labelEditorText += e.text; });
+            document.getElementById('fwd-editor').addEventListener('focus', () => {
+                document.getElementById('fwd-area').focus();
+            });
+            const context = new EditContext();
+            document.getElementById('editor').editContext = context;
+            window.editorText = '';
+            context.addEventListener('textupdate', (e) => { editorText += e.text; });
+        </script>"#;
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // A label (or text inside one) stands for its control, as in Playwright.
+    // Custom elements that forward focus to an inner input and EditContext
+    // editors (Monaco, VS Code) took typed text before and still do.
+    let steps = [
+        (
+            json!({ "action": "fill", "selector": "#name-text", "value": "Ada" }),
+            "document.getElementById('name').value",
+            json!("Ada"),
+        ),
+        (
+            json!({ "action": "fill", "selector": "#when-label", "value": "2024-01-15" }),
+            "document.getElementById('when').value",
+            json!("2024-01-15"),
+        ),
+        (
+            json!({ "action": "fill", "selector": "#field", "value": "Grace" }),
+            "inner('field')",
+            json!("Grace"),
+        ),
+        // Filling again while focus is already inside still reaches the input.
+        (
+            json!({ "action": "fill", "selector": "#field", "value": "Hopper" }),
+            "inner('field')",
+            json!("Hopper"),
+        ),
+        (
+            json!({ "action": "type", "selector": "#editor", "text": "hi" }),
+            "editorText",
+            json!("hi"),
+        ),
+        // Page JS can't see into a closed shadow root; CDP can.
+        (
+            json!({ "action": "fill", "selector": "#closed", "value": "Hopper" }),
+            "closedInput.value",
+            json!("Hopper"),
+        ),
+        (
+            json!({ "action": "fill", "selector": "#closed", "value": "Grace" }),
+            "closedInput.value",
+            json!("Grace"),
+        ),
+        // A form-associated custom element is itself a label's control.
+        (
+            json!({ "action": "fill", "selector": "#email", "value": "ada@example.com" }),
+            "inner('email')",
+            json!("ada@example.com"),
+        ),
+        (
+            json!({ "action": "fill", "selector": "#email-label", "value": "grace@example.com" }),
+            "inner('email')",
+            json!("grace@example.com"),
+        ),
+        // A custom element that takes focus keeps the text, even inside a
+        // label whose control is another field.
+        (
+            json!({ "action": "fill", "selector": "#plain", "value": "Lin" }),
+            "[inner('plain'), document.getElementById('other').value]",
+            json!(["Lin", ""]),
+        ),
+        // A form control inside editable content takes focus itself; its
+        // editing host must not.
+        (
+            json!({ "action": "fill", "selector": "#inside", "value": "new" }),
+            "[document.getElementById('inside').value, document.getElementById('ce-box').textContent]",
+            json!(["new", "outer"]),
+        ),
+        (
+            json!({ "action": "type", "selector": "#inside", "text": "Z" }),
+            "[document.getElementById('inside').value, document.getElementById('ce-box').textContent]",
+            json!(["newZ", "outer"]),
+        ),
+        // A built-in element can delegate focus into a closed shadow root too.
+        (
+            json!({ "action": "fill", "selector": "#closed-div", "value": "Ada" }),
+            "closedDivInput.value",
+            json!("Ada"),
+        ),
+        (
+            json!({ "action": "type", "selector": "#closed-div", "text": "!" }),
+            "closedDivInput.value",
+            json!("Ada!"),
+        ),
+        (
+            json!({ "action": "fill", "selector": "#closed-labelled", "value": "Lin" }),
+            "[labelledInput.value, document.getElementById('other-labelled').value]",
+            json!(["Lin", ""]),
+        ),
+        // An EditContext editor is a text target itself, inside a label too.
+        (
+            json!({ "action": "fill", "selector": "#label-editor", "value": "REPLACE" }),
+            "[labelEditorText, document.getElementById('label-other').value]",
+            json!(["REPLACE", "keep"]),
+        ),
+        // Clearing applies to inputs and textareas only: `value = ''` on an
+        // <li> sets value="0" and renumbers the list.
+        (
+            json!({ "action": "fill", "selector": "#list-item", "value": "X" }),
+            "[document.getElementById('list-item').getAttribute('value'),
+              document.getElementById('list-editor').textContent.includes('X')]",
+            json!([null, true]),
+        ),
+        // An editing host that moves focus to a control inside it stands for
+        // that control, like a shadow host.
+        (
+            json!({ "action": "type", "selector": "#fwd-editor", "text": "text" }),
+            "[document.getElementById('fwd-area').value, document.getElementById('fwd-editor').textContent]",
+            json!(["text", "notes "]),
+        ),
+        (
+            json!({ "action": "type", "selector": "#fwd-editor", "text": "!" }),
+            "[document.getElementById('fwd-area').value, document.getElementById('fwd-editor').textContent]",
+            json!(["text!", "notes "]),
+        ),
+        // A component that forwards focus from its own focus() keeps working
+        // when focus is already inside.
+        (
+            json!({ "action": "fill", "selector": "#override", "value": "one" }),
+            "inner('override')",
+            json!("one"),
+        ),
+        (
+            json!({ "action": "fill", "selector": "#override", "value": "two" }),
+            "inner('override')",
+            json!("two"),
+        ),
+        // A built-in element whose focus handler passes focus to a control
+        // inside it stands for that control.
+        (
+            json!({ "action": "type", "selector": "#wrap", "text": "hello" }),
+            "document.getElementById('wrap-area').value",
+            json!("hello"),
+        ),
+        (
+            json!({ "action": "type", "selector": "#wrap", "text": "!" }),
+            "document.getElementById('wrap-area').value",
+            json!("hello!"),
+        ),
+        // So does one that passes focus on in a microtask, into a same-origin
+        // frame, or after stopping the event; the second time, focus is
+        // already there.
+        (
+            json!({ "action": "type", "selector": "#later", "text": "A" }),
+            "document.getElementById('later-input').value",
+            json!("A"),
+        ),
+        (
+            json!({ "action": "type", "selector": "#later", "text": "B" }),
+            "document.getElementById('later-input').value",
+            json!("AB"),
+        ),
+        // Or that blurs itself first, so focus is on the body when focus()
+        // returns, in a label whose control is another field too.
+        (
+            json!({ "action": "fill", "selector": "#blur-later", "value": "X" }),
+            "document.getElementById('blur-later-input').value",
+            json!("X"),
+        ),
+        (
+            json!({ "action": "type", "selector": "#blur-later", "text": "Y" }),
+            "document.getElementById('blur-later-input').value",
+            json!("XY"),
+        ),
+        (
+            json!({ "action": "fill", "selector": "#blur-labelled", "value": "X" }),
+            "[document.getElementById('blur-labelled-input').value, document.getElementById('blur-keep').value]",
+            json!(["X", "KEEP"]),
+        ),
+        (
+            json!({ "action": "type", "selector": "#blur-labelled", "text": "Y" }),
+            "[document.getElementById('blur-labelled-input').value, document.getElementById('blur-keep').value]",
+            json!(["XY", "KEEP"]),
+        ),
+        // Content Chrome edits through -webkit-user-modify, which leaves
+        // isContentEditable false, takes text like contenteditable, inside a
+        // label for another field too. Focus puts the caret at the start.
+        (
+            json!({ "action": "fill", "selector": "#css-editor", "value": "X" }),
+            "document.getElementById('css-editor').textContent",
+            json!("Xhello"),
+        ),
+        (
+            json!({ "action": "type", "selector": "#css-editor", "text": "Y" }),
+            "document.getElementById('css-editor').textContent",
+            json!("XYhello"),
+        ),
+        (
+            json!({ "action": "fill", "selector": "#css-plain", "value": "X" }),
+            "document.getElementById('css-plain').textContent",
+            json!("Xplain"),
+        ),
+        // Content inside one that can't take focus hands it to the editor.
+        (
+            json!({ "action": "fill", "selector": "#css-span", "value": "X" }),
+            "document.getElementById('css-host').textContent",
+            json!("Xspan"),
+        ),
+        (
+            json!({ "action": "fill", "selector": "#css-labelled", "value": "X" }),
+            "[document.getElementById('css-labelled').textContent, document.getElementById('css-keep').value]",
+            json!(["Xnote", "KEEP"]),
+        ),
+        (
+            json!({ "action": "type", "selector": "#css-labelled", "text": "Y" }),
+            "[document.getElementById('css-labelled').textContent, document.getElementById('css-keep').value]",
+            json!(["XYnote", "KEEP"]),
+        ),
+        // So does one made in a frame and moved into this document, whose
+        // prototypes are the frame's.
+        (
+            json!({ "action": "fill", "selector": "#adopted-fwd", "value": "X" }),
+            "document.getElementById('adopted-fwd-input').value",
+            json!("X"),
+        ),
+        (
+            json!({ "action": "type", "selector": "#adopted-fwd", "text": "Y" }),
+            "document.getElementById('adopted-fwd-input').value",
+            json!("XY"),
+        ),
+        // An SVG element passes focus on by its own focus() or a handler; its
+        // native focus() is SVG's, not HTML's.
+        (
+            json!({ "action": "fill", "selector": "#svg-override", "value": "X" }),
+            "document.getElementById('svg-override-input').value",
+            json!("X"),
+        ),
+        (
+            json!({ "action": "type", "selector": "#svg-override", "text": "Y" }),
+            "document.getElementById('svg-override-input').value",
+            json!("XY"),
+        ),
+        (
+            json!({ "action": "fill", "selector": "#svg-handler", "value": "X" }),
+            "document.getElementById('svg-handler-input').value",
+            json!("X"),
+        ),
+        (
+            json!({ "action": "type", "selector": "#svg-handler", "text": "Y" }),
+            "document.getElementById('svg-handler-input').value",
+            json!("XY"),
+        ),
+        (
+            json!({ "action": "type", "selector": "#frame-wrap", "text": "A" }),
+            "frameField().value",
+            json!("A"),
+        ),
+        (
+            json!({ "action": "type", "selector": "#frame-wrap", "text": "B" }),
+            "frameField().value",
+            json!("AB"),
+        ),
+        (
+            json!({ "action": "type", "selector": "#stop", "text": "A" }),
+            "inner('stop')",
+            json!("A"),
+        ),
+        (
+            json!({ "action": "type", "selector": "#stop", "text": "B" }),
+            "inner('stop')",
+            json!("AB"),
+        ),
+        // So does a host, built-in or custom, whose focus handler passes focus
+        // into its closed shadow root, again when focus is already inside.
+        (
+            json!({ "action": "fill", "selector": "#closed-wrap", "value": "one" }),
+            "closedWrapInput.value",
+            json!("one"),
+        ),
+        (
+            json!({ "action": "fill", "selector": "#closed-wrap", "value": "two" }),
+            "closedWrapInput.value",
+            json!("two"),
+        ),
+        (
+            json!({ "action": "type", "selector": "#closed-wrap", "text": "!" }),
+            "closedWrapInput.value",
+            json!("two!"),
+        ),
+        (
+            json!({ "action": "fill", "selector": "#closed-custom", "value": "one" }),
+            "closedCustomInput.value",
+            json!("one"),
+        ),
+        (
+            json!({ "action": "fill", "selector": "#closed-custom", "value": "two" }),
+            "closedCustomInput.value",
+            json!("two"),
+        ),
+        (
+            json!({ "action": "type", "selector": "#closed-custom", "text": "!" }),
+            "closedCustomInput.value",
+            json!("two!"),
+        ),
+        // However deep the promise chain before the handler passes focus on.
+        (
+            json!({ "action": "fill", "selector": "#deep5", "value": "Ada" }),
+            "document.getElementById('deep5-input').value",
+            json!("Ada"),
+        ),
+        (
+            json!({ "action": "type", "selector": "#deep5", "text": "!" }),
+            "document.getElementById('deep5-input').value",
+            json!("Ada!"),
+        ),
+        (
+            json!({ "action": "fill", "selector": "#deep20", "value": "Ada" }),
+            "document.getElementById('deep20-input').value",
+            json!("Ada"),
+        ),
+        (
+            json!({ "action": "type", "selector": "#deep20", "text": "!" }),
+            "document.getElementById('deep20-input').value",
+            json!("Ada!"),
+        ),
+    ];
+    for (mut cmd, script, expected) in steps {
+        cmd["id"] = json!("step");
+        let resp = execute_command(&cmd, &mut state).await;
+        assert_success(&resp);
+        assert_evaluate(&mut state, "check", script, expected).await;
+    }
+
+    // A page whose setTimeout never fires (a fake clock) doesn't stall fill
+    // or type, and focus passed on in a microtask is still followed.
+    let stub =
+        json!({ "id": "stub", "action": "evaluate", "script": "window.setTimeout = () => 0" });
+    assert_success(&execute_command(&stub, &mut state).await);
+    let stubbed = [
+        (
+            json!({ "action": "fill", "selector": "#name", "value": "Lin" }),
+            "document.getElementById('name').value",
+            json!("Lin"),
+        ),
+        (
+            json!({ "action": "type", "selector": "#later", "text": "C" }),
+            "document.getElementById('later-input').value",
+            json!("ABC"),
+        ),
+    ];
+    for (mut cmd, script, expected) in stubbed {
+        cmd["id"] = json!("stubbed");
+        let resp = execute_command(&cmd, &mut state).await;
+        assert_success(&resp);
+        assert_evaluate(&mut state, "stubbed", script, expected).await;
+    }
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_type_into_a_display_contents_editor_needs_the_caret_inside() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // With no box the editor can't take focus, but a caret inside it still
+    // receives typed text.
+    let html = r#"<div id="editor" contenteditable style="display: contents">text</div>
+        <input id="other" value="keep"><iframe id="frame" srcdoc="<input id='inner'>"></iframe>"#;
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let observe =
+        "[document.getElementById('editor').textContent, document.getElementById('other').value,
+        document.getElementById('frame').contentDocument.getElementById('inner').value]";
+
+    let caret_inside = "(() => { const text = document.getElementById('editor').firstChild; getSelection().collapse(text, text.length); })()";
+    assert_success(
+        &execute_command(
+            &json!({ "id": "3", "action": "evaluate", "script": caret_inside }),
+            &mut state,
+        )
+        .await,
+    );
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "type", "selector": "#editor", "text": "!" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_evaluate(&mut state, "5", observe, json!(["text!", "keep", ""])).await;
+
+    // With focus in another field the text would land there instead. A
+    // focused frame keeps this document's caret in the editor, so the caret
+    // alone is not enough.
+    let elsewhere = [
+        "document.getElementById('other').focus()",
+        "(() => { const text = document.getElementById('editor').firstChild; getSelection().collapse(text, text.length);
+            document.getElementById('frame').contentDocument.getElementById('inner').focus(); })()",
+    ];
+    for script in elsewhere {
+        assert_success(
+            &execute_command(
+                &json!({ "id": "6", "action": "evaluate", "script": script }),
+                &mut state,
+            )
+            .await,
+        );
+        let resp = execute_command(
+            &json!({ "id": "7", "action": "type", "selector": "#editor", "text": "?" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(resp["success"], false, "{script}: {resp}");
+        assert!(
+            resp["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("did not take focus"),
+            "{script}: {resp}"
+        );
+        assert_evaluate(&mut state, "8", observe, json!(["text!", "keep", ""])).await;
+    }
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_fill_and_type_keep_the_caret_in_shadow_root_editors() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Editors in shadow roots: delegatesFocus components reached through
+    // their host, and an editor and a display: contents editor reached by
+    // ref. A caret placed in a shadow tree reads through
+    // document.getSelection() as the host's position, as after a click.
+    let html = r#"<input id="other">
+        <x-df id="df-ed"></x-df><x-df id="df-fill"></x-df>
+        <x-open id="open-ed"></x-open><x-dc id="dc-host"></x-dc>
+        <iframe id="frame" srcdoc="<input id='field'>"></iframe>
+        <script>
+            const editor = (label, style) =>
+                `<div id="inner" role="textbox" contenteditable aria-label="${label}" style="${style}">hello world<br></div>`;
+            customElements.define('x-df', class extends HTMLElement {
+                constructor() {
+                    super();
+                    this.attachShadow({ mode: 'open', delegatesFocus: true }).innerHTML = editor(this.id, '');
+                }
+            });
+            customElements.define('x-open', class extends HTMLElement {
+                constructor() {
+                    super();
+                    this.attachShadow({ mode: 'open' }).innerHTML = editor('Open editor', '');
+                }
+            });
+            customElements.define('x-dc', class extends HTMLElement {
+                constructor() {
+                    super();
+                    this.attachShadow({ mode: 'open' }).innerHTML = editor('Contents editor', 'display: contents');
+                }
+            });
+            window.inner = (id) => document.getElementById(id).shadowRoot.getElementById('inner');
+            window.caretIn = (id, offset) => {
+                const el = inner(id);
+                el.focus();
+                el.getRootNode().getSelection().collapse(el.firstChild, offset);
+            };
+        </script>"#;
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "snapshot", "interactive": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let snapshot = get_data(&resp)["snapshot"].as_str().unwrap_or_default();
+    let ref_for = |label: &str| {
+        snapshot
+            .lines()
+            .find(|line| line.contains(&format!("\"{label}\"")))
+            .and_then(|line| line.split("[ref=").nth(1))
+            .and_then(|rest| rest.split([']', ',']).next())
+            .map(|id| format!("@{id}"))
+            .unwrap_or_else(|| panic!("no ref for {label} in {snapshot}"))
+    };
+    let open_editor = ref_for("Open editor");
+    let contents_editor = ref_for("Contents editor");
+
+    // With the caret in the middle of the text, typing goes there, not to the
+    // end. fill types where focus() puts the caret, here at the start.
+    let rows = [
+        (
+            "caretIn('df-ed', 5)",
+            "type",
+            "text",
+            "#df-ed".to_string(),
+            "df-ed",
+        ),
+        (
+            "caretIn('open-ed', 5)",
+            "type",
+            "text",
+            open_editor,
+            "open-ed",
+        ),
+        (
+            "caretIn('dc-host', 5)",
+            "type",
+            "text",
+            contents_editor.clone(),
+            "dc-host",
+        ),
+        (
+            "document.getElementById('other').focus()",
+            "fill",
+            "value",
+            "#df-fill".to_string(),
+            "df-fill",
+        ),
+    ];
+    for (setup, action, key, selector, host) in rows {
+        let setup = json!({ "id": "setup", "action": "evaluate", "script": setup });
+        assert_success(&execute_command(&setup, &mut state).await);
+        let text = if action == "fill" { "Y" } else { "X" };
+        let resp = execute_command(
+            &json!({ "id": host, "action": action, "selector": selector, key: text }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        let expected = if action == "fill" {
+            "Yhello world<br>"
+        } else {
+            "helloX world<br>"
+        };
+        let script = format!("inner('{host}').innerHTML");
+        assert_evaluate(&mut state, host, &script, json!(expected)).await;
+    }
+
+    // A focused frame keeps the caret in the shadow tree, but the text would
+    // go to the frame's field.
+    let caret_then_frame = "caretIn('dc-host', 5); \
+        document.getElementById('frame').contentDocument.getElementById('field').focus()";
+    let setup = json!({ "id": "setup", "action": "evaluate", "script": caret_then_frame });
+    assert_success(&execute_command(&setup, &mut state).await);
+    let resp = execute_command(
+        &json!({ "id": "frame", "action": "type", "selector": contents_editor, "text": "?" }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(resp["success"], false, "{resp}");
+    assert_evaluate(
+        &mut state,
+        "frame",
+        "[inner('dc-host').innerHTML, document.getElementById('frame').contentDocument.getElementById('field').value]",
+        json!(["helloX world<br>", ""]),
+    )
+    .await;
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_fill_and_type_follow_focus_from_shadow_textboxes() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Textboxes inside shadow trees, reached by ref, whose focus handlers pass
+    // focus on: to an input slotted in from the host's light DOM, in an open or
+    // a closed shadow root, from a textbox or from the slot itself (each once
+    // inside a label whose control holds KEEP), or to an input of their own in
+    // a closed shadow root. Last, hosts that the page's own capture listener,
+    // on the document or added to the window at load, passes focus on from
+    // before stopping the event: into their shadow input, or for a light-DOM
+    // host back to its slotted input, whose own focus events it stops too.
+    // A page that stops blur and focusout as well leaves only whether the host
+    // can take focus at all, read before its focus handler can drop its
+    // tabindex. Then editors that are display: contents in a shadow root, with
+    // the caret in light-DOM text slotted into them.
+    let html = r#"<input id="other">
+        <x-slot-box id="slot-box"><input id="slotted"></x-slot-box>
+        <x-slot-label id="slot-label"><input id="labelled-slotted"></x-slot-label>
+        <x-closed-box></x-closed-box>
+        <x-closed-slot-box><input id="closed-slotted"></x-closed-slot-box>
+        <x-closed-slot-label><input id="closed-labelled-slotted"></x-closed-slot-label>
+        <x-closed-slot-beside><input slot="inside"><input id="beside" slot="beside"></x-closed-slot-beside>
+        <x-slot-target><input id="slot-target-input"></x-slot-target>
+        <x-slot-target-label><input id="slot-target-labelled"></x-slot-target-label>
+        <div id="stopped" tabindex="0"></div>
+        <label><div id="stopped-labelled" tabindex="0"></div> <input id="stopped-keep" value="KEEP"></label>
+        <div id="win-stopped" tabindex="0"></div>
+        <label><div id="win-stopped-labelled" tabindex="0"></div> <input id="win-stopped-keep" value="KEEP"></label>
+        <x-light-host id="light-host" tabindex="0"><input id="light-input"></x-light-host>
+        <x-guard id="guard-host" tabindex="0"><input id="guard-input"></x-guard>
+        <label><input id="guard-keep" value="KEEP"> <x-guard id="guard-labelled" tabindex="0"><input id="guard-labelled-input"></x-guard></label>
+        <x-guard id="guard-box"><input id="guard-box-input" value="Ada"></x-guard>
+        <x-drop id="drop-host" tabindex="0"><input id="drop-input"></x-drop>
+        <label><input id="drop-keep" value="KEEP"> <x-drop id="drop-labelled" tabindex="0"><input id="drop-labelled-input"></x-drop></label>
+        <div id="slotted-ce-open" contenteditable>hello</div>
+        <div id="slotted-ce-closed" contenteditable>hello</div>
+        <script>
+            const textbox = (label) => `<div id="box" role="textbox" tabindex="0" aria-label="${label}"><slot></slot></div>`;
+            const forward = (root, input) => root.getElementById('box').addEventListener('focus', () => input.focus());
+            customElements.define('x-slot-box', class extends HTMLElement {
+                constructor() {
+                    super();
+                    const root = this.attachShadow({ mode: 'open' });
+                    root.innerHTML = textbox('Slot box');
+                    forward(root, this.querySelector('input'));
+                }
+            });
+            customElements.define('x-slot-label', class extends HTMLElement {
+                constructor() {
+                    super();
+                    const root = this.attachShadow({ mode: 'open' });
+                    root.innerHTML = `<label>${textbox('Labelled slot box')} <input id="keep" value="KEEP"></label>`;
+                    forward(root, this.querySelector('input'));
+                }
+            });
+            customElements.define('x-closed-box', class extends HTMLElement {
+                constructor() {
+                    super();
+                    const root = this.attachShadow({ mode: 'closed' });
+                    root.innerHTML = '<div id="box" role="textbox" tabindex="0" aria-label="Closed box"><input></div>';
+                    window.closedBoxInput = root.querySelector('input');
+                    forward(root, closedBoxInput);
+                }
+            });
+            window.keeps = {};
+            const closedHost = (name, html, input) => customElements.define(name, class extends HTMLElement {
+                constructor() {
+                    super();
+                    const root = this.attachShadow({ mode: 'closed' });
+                    root.innerHTML = html;
+                    keeps[name] = root.getElementById('keep');
+                    forward(root, this.querySelector(input));
+                }
+            });
+            closedHost('x-closed-slot-box', textbox('Closed slot box'), 'input');
+            closedHost('x-closed-slot-label', `<label>${textbox('Labelled closed slot box')} <input id="keep" value="KEEP"></label>`, 'input');
+            // Its textbox passes focus to an input slotted beside it, not into it.
+            closedHost('x-closed-slot-beside', '<div id="box" role="textbox" tabindex="0" aria-label="Beside slot box"><slot name="inside"></slot></div><slot name="beside"></slot>', '#beside');
+            // A slot with a box takes focus; a title names it for the snapshot.
+            const slotTarget = (title) => `<slot id="box" role="textbox" tabindex="0" style="display: block" title="${title}"></slot>`;
+            closedHost('x-slot-target', slotTarget('Slot target'), 'input');
+            closedHost('x-slot-target-label', `<label>${slotTarget('Labelled slot target')} <input id="keep" value="KEEP"></label>`, 'input');
+            const stopped = ['stopped', 'stopped-labelled'];
+            for (const id of stopped) document.getElementById(id).attachShadow({ mode: 'open' }).innerHTML = '<input>';
+            window.stoppedInput = (id) => document.getElementById(id).shadowRoot.querySelector('input');
+            document.addEventListener('focus', (event) => {
+                const host = event.composedPath()[0];
+                if (!stopped.includes(host.id)) return;
+                stoppedInput(host.id).focus();
+                event.stopImmediatePropagation();
+            }, true);
+            const winStopped = ['win-stopped', 'win-stopped-labelled'];
+            for (const id of winStopped) document.getElementById(id).attachShadow({ mode: 'open' }).innerHTML = '<input>';
+            customElements.define('x-light-host', class extends HTMLElement {
+                constructor() {
+                    super();
+                    this.attachShadow({ mode: 'open' }).innerHTML = '<slot></slot>';
+                }
+            });
+            addEventListener('focus', (event) => {
+                const target = event.composedPath()[0];
+                if (target.id === 'light-input') return event.stopImmediatePropagation();
+                const to = target.id === 'light-host' ? document.getElementById('light-input')
+                    : winStopped.includes(target.id) ? stoppedInput(target.id) : null;
+                if (!to) return;
+                to.focus();
+                event.stopImmediatePropagation();
+            }, true);
+            class Guard extends HTMLElement {
+                constructor() {
+                    super();
+                    this.attachShadow({ mode: 'open' }).innerHTML = '<slot></slot>';
+                }
+            }
+            customElements.define('x-guard', Guard);
+            // x-drop also drops its tabindex as it passes focus on, as a roving
+            // focus widget does; startInside puts it back and focuses the input
+            // directly.
+            customElements.define('x-drop', class extends Guard {});
+            const guarded = ['guard-host', 'guard-input', 'guard-labelled', 'guard-labelled-input', 'guard-box', 'guard-box-input',
+                'drop-host', 'drop-input', 'drop-labelled', 'drop-labelled-input'];
+            for (const type of ['focus', 'blur', 'focusout']) addEventListener(type, (event) => {
+                const target = event.composedPath()[0];
+                if (!guarded.includes(target.id)) return;
+                if (type === 'focus' && target.matches('x-guard, x-drop')) target.querySelector('input').focus();
+                if (type === 'focus' && target.localName === 'x-drop') target.removeAttribute('tabindex');
+                event.stopImmediatePropagation();
+            }, true);
+            window.startInside = (id) => {
+                const host = document.getElementById(id);
+                host.tabIndex = 0;
+                host.querySelector('input').focus();
+            };
+            const slottedEditor = (label) => `<div role="textbox" contenteditable aria-label="${label}" style="display: contents"><slot></slot></div>`;
+            document.getElementById('slotted-ce-open').attachShadow({ mode: 'open' }).innerHTML = slottedEditor('Open slotted editor');
+            document.getElementById('slotted-ce-closed').attachShadow({ mode: 'closed' }).innerHTML = slottedEditor('Closed slotted editor');
+            window.caretAtEnd = (id) => {
+                const host = document.getElementById(id);
+                host.focus();
+                getSelection().collapse(host.firstChild, host.firstChild.length);
+            };
+            window.keep = () => document.getElementById('slot-label').shadowRoot.getElementById('keep').value;
+        </script>"#;
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "fill", "selector": "#other", "value": "Jane" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "snapshot", "interactive": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let snapshot = get_data(&resp)["snapshot"].as_str().unwrap_or_default();
+    let ref_for = |label: &str| {
+        snapshot
+            .lines()
+            .find(|line| line.contains(&format!("\"{label}\"")))
+            .and_then(|line| line.split("[ref=").nth(1))
+            .and_then(|rest| rest.split([']', ',']).next())
+            .map(|id| format!("@{id}"))
+            .unwrap_or_else(|| panic!("no ref for {label} in {snapshot}"))
+    };
+
+    // Fill, then type with focus already in the input. The text goes where
+    // focus went, not to the label's control, and #other keeps its value.
+    for (selector, script, expected) in [
+        (
+            ref_for("Slot box"),
+            "document.getElementById('slotted').value",
+            "XY",
+        ),
+        (
+            ref_for("Labelled slot box"),
+            "[document.getElementById('labelled-slotted').value, keep()].join(' ')",
+            "XY KEEP",
+        ),
+        (ref_for("Closed box"), "closedBoxInput.value", "XY"),
+        (
+            ref_for("Closed slot box"),
+            "document.getElementById('closed-slotted').value",
+            "XY",
+        ),
+        (
+            ref_for("Labelled closed slot box"),
+            "[document.getElementById('closed-labelled-slotted').value, keeps['x-closed-slot-label'].value].join(' ')",
+            "XY KEEP",
+        ),
+        (
+            ref_for("Slot target"),
+            "document.getElementById('slot-target-input').value",
+            "XY",
+        ),
+        (
+            ref_for("Labelled slot target"),
+            "[document.getElementById('slot-target-labelled').value, keeps['x-slot-target-label'].value].join(' ')",
+            "XY KEEP",
+        ),
+        (
+            "#stopped".to_string(),
+            "stoppedInput('stopped').value",
+            "XY",
+        ),
+        (
+            "#stopped-labelled".to_string(),
+            "[stoppedInput('stopped-labelled').value, document.getElementById('stopped-keep').value].join(' ')",
+            "XY KEEP",
+        ),
+        (
+            "#win-stopped".to_string(),
+            "stoppedInput('win-stopped').value",
+            "XY",
+        ),
+        (
+            "#win-stopped-labelled".to_string(),
+            "[stoppedInput('win-stopped-labelled').value, document.getElementById('win-stopped-keep').value].join(' ')",
+            "XY KEEP",
+        ),
+        (
+            "#light-host".to_string(),
+            "document.getElementById('light-input').value",
+            "XY",
+        ),
+        (
+            "#guard-host".to_string(),
+            "document.getElementById('guard-input').value",
+            "XY",
+        ),
+        (
+            "#guard-labelled".to_string(),
+            "[document.getElementById('guard-labelled-input').value, document.getElementById('guard-keep').value].join(' ')",
+            "XY KEEP",
+        ),
+    ] {
+        for (action, key, text) in [("fill", "value", "X"), ("type", "text", "Y")] {
+            let resp = execute_command(
+                &json!({ "id": action, "action": action, "selector": selector, key: text }),
+                &mut state,
+            )
+            .await;
+            assert_success(&resp);
+        }
+        assert_evaluate(&mut state, &selector, script, json!(expected)).await;
+        assert_evaluate(
+            &mut state,
+            "other",
+            "document.getElementById('other').value",
+            json!("Jane"),
+        )
+        .await;
+    }
+
+    // An input slotted beside the textbox, outside it, is not where its text
+    // goes, closed shadow root or not.
+    let resp = execute_command(
+        &json!({ "id": "beside", "action": "fill", "selector": ref_for("Beside slot box"), "value": "X" }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(resp["success"], false, "{resp}");
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("is not an <input>, <textarea> or [contenteditable] element"),
+        "{resp}"
+    );
+    assert_evaluate(
+        &mut state,
+        "beside",
+        "[document.getElementById('beside').value, document.getElementById('other').value]",
+        json!(["", "Jane"]),
+    )
+    .await;
+
+    // With focus starting on the input, a host that drops its tabindex as it
+    // passes focus on still took it: the text goes to the input, not to the
+    // label's control.
+    for (id, script, expected) in [
+        ("drop-host", "document.getElementById('drop-input').value", "XY"),
+        (
+            "drop-labelled",
+            "[document.getElementById('drop-labelled-input').value, document.getElementById('drop-keep').value].join(' ')",
+            "XY KEEP",
+        ),
+    ] {
+        for (action, key, text) in [("fill", "value", "X"), ("type", "text", "Y")] {
+            let setup = json!({ "id": id, "action": "evaluate", "script": format!("startInside('{id}')") });
+            assert_success(&execute_command(&setup, &mut state).await);
+            let resp = execute_command(
+                &json!({ "id": action, "action": action, "selector": format!("#{id}"), key: text }),
+                &mut state,
+            )
+            .await;
+            assert_success(&resp);
+        }
+        assert_evaluate(&mut state, id, script, json!(expected)).await;
+        assert_evaluate(
+            &mut state,
+            "other",
+            "document.getElementById('other').value",
+            json!("Jane"),
+        )
+        .await;
+    }
+
+    // A container that can't take focus, on the page that stops every focus
+    // event, keeps the field already focused inside it.
+    let setup = json!({ "id": "box", "action": "evaluate", "script": "document.getElementById('guard-box-input').focus()" });
+    assert_success(&execute_command(&setup, &mut state).await);
+    let resp = execute_command(
+        &json!({ "id": "box", "action": "fill", "selector": "#guard-box", "value": "X" }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(resp["success"], false, "{resp}");
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("is not an <input>, <textarea> or [contenteditable] element"),
+        "{resp}"
+    );
+    assert_evaluate(
+        &mut state,
+        "box",
+        "document.getElementById('guard-box-input').value",
+        json!("Ada"),
+    )
+    .await;
+
+    // The caret in light-DOM text slotted into an editor takes the text, open
+    // or closed shadow root.
+    for (label, host) in [
+        ("Open slotted editor", "slotted-ce-open"),
+        ("Closed slotted editor", "slotted-ce-closed"),
+    ] {
+        let setup =
+            json!({ "id": host, "action": "evaluate", "script": format!("caretAtEnd('{host}')") });
+        assert_success(&execute_command(&setup, &mut state).await);
+        let selector = ref_for(label);
+        for (action, key, text) in [("fill", "value", "X"), ("type", "text", "Y")] {
+            let resp = execute_command(
+                &json!({ "id": action, "action": action, "selector": selector, key: text }),
+                &mut state,
+            )
+            .await;
+            assert_success(&resp);
+        }
+        let script = format!("document.getElementById('{host}').textContent");
+        assert_evaluate(&mut state, host, &script, json!("helloXY")).await;
+    }
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// Where `settle_focus` found focus: the id of the element inside the host,
+/// or why not.
+async fn settled_on(
+    client: &super::cdp::client::CdpClient,
+    session: &str,
+    settled: super::interaction::Settled,
+) -> String {
+    use super::interaction::Settled;
+    match settled {
+        Settled::Inside(object_id) => {
+            let id = client
+                .send_command(
+                    "Runtime.callFunctionOn",
+                    Some(json!({
+                        "objectId": object_id,
+                        "functionDeclaration": "function() { return this.id; }",
+                        "returnByValue": true,
+                    })),
+                    Some(session),
+                )
+                .await
+                .unwrap();
+            format!("#{}", id["result"]["value"].as_str().unwrap_or_default())
+        }
+        Settled::PulledOut => "pulled out".to_string(),
+        Settled::Kept => "not passed on".to_string(),
+        Settled::Out => "passed out".to_string(),
+        Settled::Lost => "lost".to_string(),
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_focus_forwarding_is_read_from_the_focus_call_alone() {
+    use super::interaction::{
+        focus_call, focus_host, focusable, read_focus, settle_focus, settle_read, FocusCall,
+    };
+
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let html = r#"<input id="other">
+        <div id="box"><input id="box-input"></div>
+        <div id="later" tabindex="0"><input id="later-input"></div>
+        <a id="link" href="/next"><input id="link-input" value="KEEP"></a>
+        <details open><summary id="summary"><input id="summary-input" value="KEEP"></summary></details>
+        <div><div id="editor" contenteditable><input id="editor-input" value="KEEP"></div></div>
+        <x-dual id="dual" tabindex="0"><input id="dual-slotted"></x-dual>
+        <x-closed-fwd id="closed-fwd" tabindex="0"></x-closed-fwd>
+        <script>
+            document.getElementById('later').addEventListener('focus', () => {
+                queueMicrotask(() => document.getElementById('later-input').focus());
+            });
+            customElements.define('x-dual', class extends HTMLElement {
+                constructor() {
+                    super();
+                    const root = this.attachShadow({ mode: 'closed' });
+                    root.innerHTML = '<input id="internal"><slot></slot>';
+                    window.dualInternal = root.getElementById('internal');
+                    // Focus moving into the closed root reaches the host as a
+                    // focus event too, so the handler passes focus on once.
+                    window.dualForwards = true;
+                    this.addEventListener('focus', () => {
+                        if (dualForwards) document.getElementById('dual-slotted').focus();
+                        dualForwards = false;
+                    });
+                }
+            });
+            customElements.define('x-closed-fwd', class extends HTMLElement {
+                constructor() {
+                    super();
+                    const root = this.attachShadow({ mode: 'closed' });
+                    root.innerHTML = '<input id="closed-fwd-input">';
+                    const input = root.getElementById('closed-fwd-input');
+                    this.addEventListener('focus', () => input.focus());
+                }
+            });
+        </script>"#;
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let browser = state.browser.as_ref().unwrap();
+    let client = &browser.client;
+    let session = browser.active_session_id().unwrap();
+    let run = |script: String| async move {
+        client
+            .send_command(
+                "Runtime.evaluate",
+                Some(json!({ "expression": script })),
+                Some(session),
+            )
+            .await
+            .unwrap()
+    };
+    // Between the focus call and the read, as on a slow or remote browser:
+    // a timer focuses the input inside a container that can't take focus, or
+    // makes the container focusable while focus is already inside. Neither is
+    // the container passing focus on. A wrapper that passes focus on in a
+    // microtask still does, however long until the read.
+    for (start, host, between, expected) in [
+        (
+            "other",
+            "box",
+            "document.getElementById('box-input').focus()",
+            "not passed on",
+        ),
+        (
+            "box-input",
+            "box",
+            "document.getElementById('box').tabIndex = 0",
+            "not passed on",
+        ),
+        ("other", "later", "", "#later-input"),
+    ] {
+        run(format!(
+            "document.getElementById('box').removeAttribute('tabindex'); document.getElementById('{start}').focus()"
+        ))
+        .await;
+        let object = run(format!("document.getElementById('{host}')")).await;
+        let object_id = object["result"]["objectId"].as_str().unwrap().to_string();
+        let call = focus_host(client, session, &object_id, false)
+            .await
+            .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        run(between.to_string()).await;
+        let settled = settle_focus(client, session, &object_id, call)
+            .await
+            .unwrap();
+        assert_eq!(
+            settled_on(client, session, settled).await,
+            expected,
+            "{host} from {start}, then {between}"
+        );
+    }
+
+    // With focus on the input inside, each wrapper can take focus when that
+    // is read, but loses what makes it focusable before the call that focuses
+    // it (a tabindex, a link's href, being its details' first summary, being
+    // an editing host rather than content inside one), so its focus() does
+    // nothing. The stale answer is not the wrapper passing focus on, so fill
+    // leaves KEEP alone.
+    for (host, change) in [
+        ("box", "el.removeAttribute('tabindex')"),
+        ("link", "el.removeAttribute('href')"),
+        ("summary", "el.before(document.createElement('summary'))"),
+        ("editor", "el.parentElement.contentEditable = 'true'"),
+    ] {
+        run(format!(
+            "document.getElementById('box').tabIndex = 0; document.querySelector('#{host} input').focus()"
+        ))
+        .await;
+        let object = run(format!("document.getElementById('{host}')")).await;
+        let object_id = object["result"]["objectId"].as_str().unwrap().to_string();
+        let FocusCall::Inside(inputs) = focus_call(client, session, &object_id, false, None)
+            .await
+            .unwrap()
+        else {
+            panic!("{host}: focus inside should be read first");
+        };
+        assert!(focusable(client, session, &object_id).await, "{host}");
+        let changed = run(format!(
+            "(() => {{ const el = document.getElementById('{host}'); {change}; }})()"
+        ))
+        .await;
+        assert!(
+            changed.get("exceptionDetails").is_none(),
+            "{host}: {changed}"
+        );
+        let FocusCall::Done(call) =
+            focus_call(client, session, &object_id, false, Some((inputs, true)))
+                .await
+                .unwrap()
+        else {
+            panic!("{host}: the call with the answer should focus");
+        };
+        let settled = settle_focus(client, session, &object_id, call)
+            .await
+            .unwrap();
+        assert_eq!(
+            settled_on(client, session, settled).await,
+            "not passed on",
+            "{host}: {change}"
+        );
+    }
+
+    // The host passes focus to its slotted input, and the first read finds it
+    // there. Before the next read, page code moves it into the host's closed
+    // shadow root, where it reads as on the host: that is followed to the
+    // internal input. Moved out of the host altogether, it is lost, and
+    // nothing is filled; never the label's control. So too when the first
+    // read finds focus in the host's closed root and it leaves before that
+    // root is read.
+    let other = "document.getElementById('other').focus()";
+    for (host, between, expected) in [
+        ("dual", "", "#dual-slotted"),
+        ("dual", "dualInternal.focus()", "#internal"),
+        ("dual", other, "lost"),
+        ("closed-fwd", "", "#closed-fwd-input"),
+        ("closed-fwd", other, "lost"),
+    ] {
+        run(format!("dualForwards = true; {other}")).await;
+        let object = run(format!("document.getElementById('{host}')")).await;
+        let object_id = object["result"]["objectId"].as_str().unwrap().to_string();
+        let call = focus_host(client, session, &object_id, false)
+            .await
+            .unwrap();
+        let read = read_focus(client, session, call).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        run(between.to_string()).await;
+        let settled = settle_read(client, session, &object_id, read)
+            .await
+            .unwrap();
+        assert_eq!(
+            settled_on(client, session, settled).await,
+            expected,
+            "{host}, then {between}"
+        );
+    }
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_fill_and_type_reach_a_forwarding_wrapper_in_a_background_tab() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // A wrapper whose focus handler passes focus to the input inside it.
+    let html = r#"<input id="other" value="Jane">
+        <div id="wrap" role="textbox" tabindex="0" aria-label="Wrapper"><input id="inner"></div>
+        <script>
+            document.getElementById('wrap').addEventListener('focus', () => document.getElementById('inner').focus());
+        </script>"#;
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    // Another tab comes to the front. Chrome then holds focus events on this
+    // page until it gains focus again, so the wrapper's handler only runs in
+    // time if the page is made to behave as focused. agent-browser switches
+    // to a new tab, so switch back, then bring the other tab to the front
+    // without telling it.
+    let browser = state.browser.as_ref().unwrap();
+    let created = browser
+        .client
+        .send_command(
+            "Target.createTarget",
+            Some(json!({ "url": "about:blank" })),
+            None,
+        )
+        .await
+        .unwrap();
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "tab_switch", "tabId": "t1" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let browser = state.browser.as_ref().unwrap();
+    browser
+        .client
+        .send_command(
+            "Target.activateTarget",
+            Some(json!({ "targetId": created["targetId"] })),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_evaluate(
+        &mut state,
+        "background",
+        "[document.visibilityState, document.hasFocus()]",
+        json!(["hidden", false]),
+    )
+    .await;
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "snapshot", "interactive": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let snapshot = get_data(&resp)["snapshot"].as_str().unwrap_or_default();
+    let wrapper = snapshot
+        .lines()
+        .find(|line| line.contains("\"Wrapper\""))
+        .and_then(|line| line.split("[ref=").nth(1))
+        .and_then(|rest| rest.split([']', ',']).next())
+        .map(|id| format!("@{id}"))
+        .unwrap_or_else(|| panic!("no ref for the wrapper in {snapshot}"));
+
+    for (action, key, text) in [("fill", "value", "X"), ("type", "text", "Y")] {
+        let resp = execute_command(
+            &json!({ "id": action, "action": action, "selector": wrapper, key: text }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+    }
+    assert_evaluate(
+        &mut state,
+        "inner",
+        "[document.getElementById('inner').value, document.getElementById('other').value]",
+        json!(["XY", "Jane"]),
+    )
+    .await;
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_fill_and_type_reach_a_forwarding_wrapper_in_a_cross_origin_frame_in_a_background_tab()
+{
+    // A frame from localhost, another origin than the page on 127.0.0.1, holds
+    // a wrapper whose focus handler passes focus to the input inside it. The
+    // frame reports the input's value to the page by message.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let page = Arc::new(format!(
+        r#"<iframe id="cross" name="cross" src="http://localhost:{port}/wrap"></iframe>
+        <script>
+            window.innerValue = '';
+            addEventListener('message', (event) => {{ innerValue = event.data; }});
+        </script>"#
+    ));
+    let frame = r#"<div id="wrap" role="textbox" tabindex="0"><input id="inner"></div><script>
+        const inner = document.getElementById('inner');
+        document.getElementById('wrap').addEventListener('focus', () => inner.focus());
+        inner.addEventListener('input', () => parent.postMessage(inner.value, '*'));
+    </script>"#;
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let page = page.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let body = if buf[..n].starts_with(b"GET /wrap") {
+                    frame
+                } else {
+                    page.as_str()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let url = format!("http://127.0.0.1:{port}/");
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Another tab comes to the front, as in the background-tab test.
+    let browser = state.browser.as_ref().unwrap();
+    let created = browser
+        .client
+        .send_command(
+            "Target.createTarget",
+            Some(json!({ "url": "about:blank" })),
+            None,
+        )
+        .await
+        .unwrap();
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "tab_switch", "tabId": "t1" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let browser = state.browser.as_ref().unwrap();
+    browser
+        .client
+        .send_command(
+            "Target.activateTarget",
+            Some(json!({ "targetId": created["targetId"] })),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_evaluate(
+        &mut state,
+        "background",
+        "[document.visibilityState, document.hasFocus()]",
+        json!(["hidden", false]),
+    )
+    .await;
+
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "snapshot", "interactive": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let snapshot = get_data(&resp)["snapshot"].as_str().unwrap_or_default();
+    let frame_ref = snapshot
+        .lines()
+        .find(|line| line.contains("Iframe"))
+        .and_then(|line| line.split("[ref=").nth(1))
+        .and_then(|rest| rest.split([']', ',']).next())
+        .map(|id| format!("@{id}"))
+        .unwrap_or_else(|| panic!("no ref for the frame in {snapshot}"));
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "frame", "selector": frame_ref }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    for (action, key, text) in [("fill", "value", "X"), ("type", "text", "Y")] {
+        let resp = execute_command(
+            &json!({ "id": action, "action": action, "selector": "#wrap", key: text }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+    }
+    let resp = execute_command(&json!({ "id": "5", "action": "mainframe" }), &mut state).await;
+    assert_success(&resp);
+    // The message may arrive after the command returns. The page may be
+    // hidden, so poll from here rather than with an in-page wait.
+    let mut inner = Value::Null;
+    for _ in 0..50 {
+        let resp = execute_command(
+            &json!({ "id": "inner", "action": "evaluate", "script": "innerValue" }),
+            &mut state,
+        )
+        .await;
+        inner = get_data(&resp)["result"].clone();
+        if inner == json!("XY") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(inner, json!("XY"));
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_fill_and_type_reach_a_closed_shadow_input_in_a_frame() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // After `frame`, the host is resolved through the parent document while
+    // its closed shadow root resolves in the frame's own context.
+    let html = r#"<iframe id="closed-frame" srcdoc="<div id='host'></div><script>
+        const root = document.getElementById('host').attachShadow({ mode: 'closed', delegatesFocus: true });
+        root.innerHTML = '<input>';
+        window.hostInput = root.querySelector('input');
+    </script>"></iframe>"#;
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    for (action, key, text, expected) in [
+        ("fill", "value", "Ada", "Ada"),
+        ("type", "text", "!", "Ada!"),
+    ] {
+        let steps = [
+            json!({ "action": "frame", "selector": "#closed-frame" }),
+            json!({ "action": action, "selector": "#host", key: text }),
+            json!({ "action": "mainframe" }),
+        ];
+        for mut cmd in steps {
+            cmd["id"] = json!(action);
+            let resp = execute_command(&cmd, &mut state).await;
+            assert_success(&resp);
+        }
+        assert_evaluate(
+            &mut state,
+            action,
+            "document.getElementById('closed-frame').contentWindow.hostInput.value",
+            json!(expected),
+        )
+        .await;
+    }
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_fill_and_type_stay_in_an_iframe_editor() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // A TinyMCE-style editor: a same-origin frame whose body is the editing
+    // host (srcdoc keeps the frame same-origin with the data: page).
+    let html = r#"<input id="top-field">
+        <iframe id="editor" title="Editor" srcdoc="<body contenteditable><p id='para'>hello</p></body>"></iframe>
+        <iframe id="inert-editor" srcdoc="<body contenteditable inert><p id='para'>hello</p></body>"></iframe>"#;
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "fill", "selector": "#top-field", "value": "Jane" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // The <p> can't take focus and its frame doesn't have it, so the text
+    // used to land in #top-field, which still held focus (#2055).
+    for (action, key, text) in [("fill", "value", "[F]"), ("type", "text", "[T]")] {
+        let steps = [
+            json!({ "action": "evaluate", "script": "document.getElementById('top-field').focus()" }),
+            json!({ "action": "frame", "selector": "#editor" }),
+            json!({ "action": action, "selector": "#para", key: text }),
+            json!({ "action": "mainframe" }),
+        ];
+        for mut cmd in steps {
+            cmd["id"] = json!(action);
+            let resp = execute_command(&cmd, &mut state).await;
+            assert_success(&resp);
+        }
+        let script = format!(
+            "[document.getElementById('top-field').value,
+              document.getElementById('editor').contentDocument.body.textContent.includes('{text}')]"
+        );
+        assert_evaluate(&mut state, action, &script, json!(["Jane", true])).await;
+    }
+
+    // The frame itself, by ref, stands for its editing host, the second time
+    // with focus already inside it.
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "snapshot", "interactive": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let snapshot = get_data(&resp)["snapshot"].as_str().unwrap_or_default();
+    let frame_ref = snapshot
+        .lines()
+        .find(|line| line.contains("Iframe \"Editor\""))
+        .and_then(|line| line.split("[ref=").nth(1))
+        .and_then(|rest| rest.split([']', ',']).next())
+        .map(|id| format!("@{id}"))
+        .unwrap_or_else(|| panic!("no ref for the editor frame in {snapshot}"));
+    let focus_top = "document.getElementById('top-field').focus()";
+    let setup = json!({ "id": "ref", "action": "evaluate", "script": focus_top });
+    assert_success(&execute_command(&setup, &mut state).await);
+    for text in ["[R1]", "[R2]"] {
+        let resp = execute_command(
+            &json!({ "id": "ref", "action": "fill", "selector": frame_ref, "value": text }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        let script = format!(
+            "[document.getElementById('top-field').value,
+              document.getElementById('editor').contentDocument.body.textContent.includes('{text}')]"
+        );
+        assert_evaluate(&mut state, "ref", &script, json!(["Jane", true])).await;
+    }
+
+    // An editing host that can't take focus leaves its frame unfocused while
+    // the frame's body still reads as its activeElement; that must fail.
+    let steps = [
+        json!({ "action": "evaluate", "script": "document.getElementById('top-field').focus()" }),
+        json!({ "action": "frame", "selector": "#inert-editor" }),
+        json!({ "action": "fill", "selector": "#para", "value": "[I]" }),
+        json!({ "action": "mainframe" }),
+    ];
+    let mut results = Vec::new();
+    for mut cmd in steps {
+        cmd["id"] = json!("inert");
+        results.push(execute_command(&cmd, &mut state).await);
+    }
+    assert_eq!(results[2]["success"], false, "{}", results[2]);
+    assert!(
+        results[2]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("did not take focus"),
+        "{}",
+        results[2]
+    );
+    assert_evaluate(
+        &mut state,
+        "inert",
+        "document.getElementById('top-field').value",
+        json!("Jane"),
+    )
+    .await;
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_fill_and_type_reach_an_editor_in_a_cross_origin_frame() {
+    // The page on 127.0.0.1 frames an editor served from localhost, another
+    // origin, so page JS can't read the frame's document. The editor holds
+    // focus inside its frame and reports its text to the page by message. The
+    // frame sits in a label whose control is another input.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let page = Arc::new(format!(
+        r#"<input id="top-field">
+        <label><iframe id="cross" src="http://localhost:{port}/editor"></iframe> <input id="labelled" value="KEEP"></label>
+        <iframe id="same" srcdoc="<p>text</p>"></iframe>
+        <script>
+            window.editorText = '';
+            addEventListener('message', (event) => {{ editorText = event.data; }});
+        </script>"#
+    ));
+    let editor = r#"<div id="editor" contenteditable>hello</div><script>
+        const editor = document.getElementById('editor');
+        editor.focus();
+        getSelection().collapse(editor, editor.childNodes.length);
+        editor.addEventListener('input', () => parent.postMessage(editor.textContent, '*'));
+    </script>"#;
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let page = page.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let body = if buf[..n].starts_with(b"GET /editor") {
+                    editor
+                } else {
+                    page.as_str()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let url = format!("http://127.0.0.1:{port}/");
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "fill", "selector": "#top-field", "value": "Jane" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Text sent to the frame goes to whatever has focus inside it; fill
+    // appends there, as on other editable content. The frame stands for
+    // itself, not for its label's control.
+    for (action, key, text, expected) in [
+        ("fill", "value", "X", "helloX"),
+        ("type", "text", "Y", "helloXY"),
+    ] {
+        let resp = execute_command(
+            &json!({ "id": action, "action": action, "selector": "#cross", key: text }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        assert_evaluate(
+            &mut state,
+            action,
+            "document.getElementById('labelled').value",
+            json!("KEEP"),
+        )
+        .await;
+        let check = format!("editorText === '{expected}'");
+        let wait = json!({ "id": "wait", "action": "wait", "function": check, "timeout": 5000 });
+        assert_success(&execute_command(&wait, &mut state).await);
+    }
+
+    // A frame the page can read is still refused when nothing focused inside
+    // it takes text.
+    let resp = execute_command(
+        &json!({ "id": "same", "action": "fill", "selector": "#same", "value": "Z" }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(resp["success"], false, "{resp}");
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("is not an <input>, <textarea> or [contenteditable] element"),
+        "{resp}"
+    );
+    assert_evaluate(
+        &mut state,
+        "top",
+        "document.getElementById('top-field').value",
+        json!("Jane"),
+    )
+    .await;
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_fill_returns_on_pages_with_elements_named_host() {
+    // A document's named properties shadow `host`: with a form or frame named
+    // "host", walking up from the focused field past the document must not
+    // follow it. Pages come from 127.0.0.1; the cross-origin frame from
+    // localhost. The same-origin frame's own element with id "host" is what
+    // its window's `host` names.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let path = request.split_whitespace().nth(1).unwrap_or("/");
+                let named = match path {
+                    "/form" => r#"<form name="host"></form>"#.to_string(),
+                    "/frame" => r#"<iframe name="host" srcdoc="<p id='host'>frame</p>"></iframe>"#
+                        .to_string(),
+                    "/cross" => {
+                        format!(
+                            r#"<iframe name="host" src="http://localhost:{port}/inner"></iframe>"#
+                        )
+                    }
+                    _ => String::new(),
+                };
+                let body = format!(
+                    r#"<input id="name"><input id="hidden" style="display:none"><input id="plain">{named}"#
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    for page in ["form", "frame", "cross"] {
+        let url = format!("http://127.0.0.1:{port}/{page}");
+        let resp = execute_command(
+            &json!({ "id": page, "action": "navigate", "url": url }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        let resp = execute_command(
+            &json!({ "id": page, "action": "fill", "selector": "#name", "value": "Jane" }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        // With focus on #name, refusing the hidden input walks up from #name
+        // past the document; it must come back promptly. The normal input
+        // still fills.
+        for (selector, value, refused) in [("#hidden", "leak", true), ("#plain", "Ada", false)] {
+            let cmd = json!({ "id": page, "action": "fill", "selector": selector, "value": value });
+            let resp = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                execute_command(&cmd, &mut state),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{page}: fill {selector} did not return"));
+            if refused {
+                assert_eq!(resp["success"], false, "{page}: {resp}");
+                assert!(
+                    resp["error"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("did not take focus"),
+                    "{page}: {resp}"
+                );
+            } else {
+                assert_success(&resp);
+            }
+        }
+        assert_evaluate(
+            &mut state,
+            page,
+            "[document.getElementById('name').value, document.getElementById('plain').value]",
+            json!(["Jane", "Ada"]),
+        )
+        .await;
+    }
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_fill_returns_in_forms_with_controls_named_after_node_properties() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // A form's named controls shadow its own properties: here parentNode and
+    // assignedSlot lead from the form to a control inside it and back, and
+    // in an editor, parentElement does. Walking up from focus inside the form
+    // must still end: to a field beside it, to a wrapper around it, and into
+    // a textbox whose slot has nodes assigned. The editor's span hands its
+    // text to the editing host, not to the control named parentElement.
+    let html = r#"<form><input id="beside"><input id="field">
+        <div id="wrap" tabindex="0"><input id="wrap-input"></div>
+        <input name="parentNode"><input name="assignedSlot"></form>
+        <x-named-box><span>slotted</span></x-named-box>
+        <div id="editor" contenteditable><form><span id="span">text</span><input id="named" name="parentElement"></form></div>
+        <script>
+            customElements.define('x-named-box', class extends HTMLElement {
+                constructor() {
+                    super();
+                    this.attachShadow({ mode: 'open' }).innerHTML =
+                        '<div role="textbox" tabindex="0" aria-label="Named form box"><slot></slot></div>';
+                }
+            });
+        </script>"#;
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "snapshot", "interactive": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let snapshot = get_data(&resp)["snapshot"].as_str().unwrap_or_default();
+    let named_box = snapshot
+        .lines()
+        .find(|line| line.contains("\"Named form box\""))
+        .and_then(|line| line.split("[ref=").nth(1))
+        .and_then(|rest| rest.split([']', ',']).next())
+        .map(|id| format!("@{id}"))
+        .unwrap_or_else(|| panic!("no ref for the named form box in {snapshot}"));
+
+    let not_text = "is not an <input>, <textarea> or [contenteditable] element";
+    let focus_beside = "document.getElementById('beside').focus()";
+    for (setup, action, selector, refused) in [
+        (focus_beside, "fill", "#field".to_string(), None),
+        (focus_beside, "type", "#field".to_string(), None),
+        (
+            "document.getElementById('wrap-input').focus()",
+            "fill",
+            "#wrap".to_string(),
+            Some(not_text),
+        ),
+        (focus_beside, "fill", named_box, Some(not_text)),
+        (
+            "document.activeElement.blur()",
+            "fill",
+            "#span".to_string(),
+            None,
+        ),
+    ] {
+        let setup = json!({ "id": "setup", "action": "evaluate", "script": setup });
+        assert_success(&execute_command(&setup, &mut state).await);
+        let key = if action == "fill" { "value" } else { "text" };
+        let cmd = json!({ "id": action, "action": action, "selector": selector, key: "X" });
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            execute_command(&cmd, &mut state),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{action} {selector} did not return"));
+        match refused {
+            Some(error) => {
+                assert_eq!(resp["success"], false, "{action} {selector}: {resp}");
+                assert!(
+                    resp["error"].as_str().unwrap_or_default().contains(error),
+                    "{action} {selector}: {resp}"
+                );
+            }
+            None => assert_success(&resp),
+        }
+    }
+    assert_evaluate(
+        &mut state,
+        "values",
+        "[document.getElementById('field').value, document.getElementById('editor').textContent.includes('X'), document.getElementById('named').value]",
+        json!(["XX", true, ""]),
+    )
+    .await;
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
 async fn e2e_select_option_label_override_names() {
     let mut state = DaemonState::new();
     let resp = execute_command(

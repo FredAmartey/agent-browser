@@ -82,6 +82,8 @@ Visible-label matching treats non-breaking and ordinary spaces equivalently.
 
 Clicks fail before dispatch when another element covers the target's click point. The error names the covering element, for example `covered by <div#consent-banner>`. Dismiss or interact with that element, run a fresh snapshot, then retry the original action.
 
+`fill` sets date, time, color and range inputs directly, so pass the value in the input's own format (`2024-01-15` for a date, `#ff8800` for a color); a value the input rejects fails with `Malformed value` and leaves the field unchanged. `fill` and `type` fail on elements that can't take text, such as selects, checkboxes, buttons and hidden inputs. Use `select`, `check` or `click` for those.
+
 ## Get Information
 
 ```bash
