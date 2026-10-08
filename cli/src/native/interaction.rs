@@ -143,20 +143,9 @@ pub async fn fill(
     )
     .await?;
 
-    // Focus the element
-    client
-        .send_command_typed::<_, Value>(
-            "Runtime.callFunctionOn",
-            &CallFunctionOnParams {
-                function_declaration: "function() { this.focus(); }".to_string(),
-                object_id: Some(object_id.clone()),
-                arguments: None,
-                return_by_value: Some(true),
-                await_promise: Some(false),
-            },
-            Some(&effective_session_id),
-        )
-        .await?;
+    if prepare_text_entry(client, &effective_session_id, &object_id, Some(value)).await? {
+        return Ok(());
+    }
 
     // Select all + delete to clear
     client
@@ -212,20 +201,7 @@ pub async fn type_text(
     )
     .await?;
 
-    // Focus
-    client
-        .send_command_typed::<_, Value>(
-            "Runtime.callFunctionOn",
-            &CallFunctionOnParams {
-                function_declaration: "function() { this.focus(); }".to_string(),
-                object_id: Some(object_id.clone()),
-                arguments: None,
-                return_by_value: Some(true),
-                await_promise: Some(false),
-            },
-            Some(&effective_session_id),
-        )
-        .await?;
+    prepare_text_entry(client, &effective_session_id, &object_id, None).await?;
 
     if clear {
         client
@@ -249,6 +225,98 @@ pub async fn type_text(
     }
 
     type_text_into_active_context(client, session_id, text, delay_ms).await
+}
+
+/// Focuses the element for `fill` (`fill_value` set) or `type` and checks, in
+/// the same call, that focus landed on it so text cannot leak elsewhere.
+/// Follows Playwright's fill contract: elements that cannot take text are
+/// refused before any field is touched, and fill sets date-like, color and
+/// range inputs directly because Chrome drops inserted text there. Returns
+/// true when the value is already set and no text needs to be inserted.
+async fn prepare_text_entry(
+    client: &CdpClient,
+    session_id: &str,
+    object_id: &str,
+    fill_value: Option<&str>,
+) -> Result<bool, String> {
+    let js = r#"function(value) {
+        const filling = typeof value === 'string';
+        const verb = filling ? 'filled' : 'typed into';
+        const tag = this.localName;
+        if (tag === 'select' || tag === 'button') {
+            return { error: `Element <${tag}> cannot be ${verb}` };
+        }
+        if ((tag === 'input' || tag === 'textarea') && this.matches(':disabled')) {
+            return { error: `Disabled <${tag}> cannot be ${verb}` };
+        }
+        const type = tag === 'input' ? this.type : '';
+        if (['checkbox', 'radio', 'button', 'submit', 'reset', 'file', 'image', 'hidden'].includes(type)) {
+            return { error: `Input of type "${type}" cannot be ${verb}` };
+        }
+        const formats = {
+            color: '#rrggbb', date: 'YYYY-MM-DD', time: 'HH:MM or HH:MM:SS',
+            'datetime-local': 'YYYY-MM-DDTHH:MM', month: 'YYYY-MM', week: 'YYYY-Www',
+            range: `a number from ${this.min || 0} to ${this.max || 100} in steps of ${this.step || 1}`,
+        };
+        if (type in formats) {
+            if (!filling) {
+                return { error: `Input of type "${type}" cannot be typed into; use fill` };
+            }
+            // Chrome sanitizes a value it cannot parse instead of throwing:
+            // date-like types become empty, color becomes #000000 and range
+            // falls back to its midpoint, which can equal Number(text) for
+            // text like "+50", hence the number syntax check.
+            const text = value.trim();
+            const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+            const old = this.value;
+            setValue.call(this, text);
+            const accepted = type === 'color' ? this.value === text.toLowerCase()
+                : type === 'range' ? /^-?(\d+(\.\d+)?|\.\d+)([eE][-+]?\d+)?$/.test(text) && Number(this.value) === Number(text)
+                : this.value !== '' || text === '';
+            if (!accepted) {
+                setValue.call(this, old);
+                return { error: `Malformed value ${JSON.stringify(value)} for input of type "${type}": expected ${formats[type]}` };
+            }
+            this.focus();
+            this.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+            this.dispatchEvent(new Event('change', { bubbles: true }));
+            return { done: true };
+        }
+        this.focus();
+        // A wrapper may hand focus to a field inside it. A label hands it to
+        // its control, which need not be inside the label.
+        const active = this.getRootNode().activeElement;
+        if (tag !== 'label' && !(active && this.contains(active))) {
+            return { error: `Element did not take focus, so it cannot be ${verb}` };
+        }
+        return { done: false };
+    }"#;
+
+    let result = client
+        .send_command_typed::<_, Value>(
+            "Runtime.callFunctionOn",
+            &CallFunctionOnParams {
+                function_declaration: js.to_string(),
+                object_id: Some(object_id.to_string()),
+                arguments: Some(vec![CallArgument {
+                    value: Some(serde_json::json!(fill_value)),
+                    object_id: None,
+                }]),
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            },
+            Some(session_id),
+        )
+        .await?;
+
+    let outcome = result.get("result").and_then(|r| r.get("value"));
+    if let Some(error) = outcome.and_then(|v| v.get("error")).and_then(Value::as_str) {
+        return Err(error.to_string());
+    }
+    Ok(outcome
+        .and_then(|v| v.get("done"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false))
 }
 
 pub async fn type_text_into_active_context(
